@@ -49,6 +49,16 @@ Logs may show `Empty response … provider=kiro-acp` or
 All of this lives in the plugin, never in hermes-agent core, so `hermes update`
 cannot erase it.
 
+## kiro-console integration
+
+Each spawn reads `$KIRO_CONSOLE_HOME/active-seat.json` (default
+`~/.kiro-console`) and uses its existing seat HOME for Kiro and its bridge
+agent config. Missing, unreadable, malformed, null-HOME or nonexistent-directory
+selections use the original spawn. End-of-turn credit metadata is appended to
+`metering.jsonl` in that root (new files mode 600); the root is never created by
+the plugin, and append failures do not fail the turn. Seat and model are bound
+to the running turn, so changing seats does not relabel an in-flight process.
+
 ## When the symptom comes back
 
 1. **Is the fix installed?** In every plugin copy

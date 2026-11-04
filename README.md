@@ -80,6 +80,16 @@ The default argv selects the `hermes-bridge` agent. Before each spawn the plugin
 writes `~/.kiro/agents/hermes-bridge.json` (no tools, no MCP servers) when it is
 missing or differs; Hermes' tools stay the only way the model can act.
 
+## kiro-console integration
+
+When kiro-console is installed, each spawn reads `active-seat.json` under
+`$KIRO_CONSOLE_HOME` (default `~/.kiro-console`). An existing seat HOME is used
+for Kiro and its bridge agent configuration; a missing, unreadable, malformed,
+null-HOME or nonexistent-directory selection falls back to the normal spawn.
+Completed-turn credit metadata is appended to `metering.jsonl` in that data
+root (created mode 600); the plugin never creates the data root, and metering
+errors do not interrupt a turn.
+
 ## Development
 
 ```bash

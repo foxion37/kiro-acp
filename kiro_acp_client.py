@@ -15,11 +15,14 @@ kiro-cli specifics verified against v2.22.0:
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import os
 import re
 import shlex
+import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +31,7 @@ from agent.acp_openai_bridge import TOOL_CALL_CONTRACT
 from agent.copilot_acp_client import ACP_MARKER_BASE_URL as _COPILAT_MARKER, CopilotACPClient
 
 logger = logging.getLogger(__name__)
+_turn_context = contextvars.ContextVar("kiro_console_turn", default=None)
 
 KIRO_MARKER_BASE_URL = "acp://kiro"
 
@@ -212,13 +216,12 @@ def resolve_kiro_args() -> list[str]:
     return shlex.split(os.getenv("HERMES_KIRO_ACP_ARGS", "").strip()) or list(DEFAULT_KIRO_ARGS)
 
 
-def ensure_kiro_agent(args: list[str]) -> None:
-    """Write the tool-less agent config into Kiro's global agent dir when ``args`` select it and the
-    file is missing or differs. Other agents are the user's own and stay untouched."""
+def ensure_kiro_agent(args: list[str], home: str | None = None) -> None:
+    """Write the tool-less agent config in the selected HOME when needed."""
     if not any(a == "--agent" and b == KIRO_AGENT_NAME for a, b in zip(args, args[1:])) \
             and f"--agent={KIRO_AGENT_NAME}" not in args:
         return
-    path = Path.home() / ".kiro" / "agents" / f"{KIRO_AGENT_NAME}.json"
+    path = (Path(home) if home else Path.home()) / ".kiro" / "agents" / f"{KIRO_AGENT_NAME}.json"
     text = json.dumps(_KIRO_AGENT_CONFIG, indent=2) + "\n"
     try:
         if path.is_file() and path.read_text(encoding="utf-8") == text:
@@ -252,6 +255,26 @@ class KiroACPClient(CopilotACPClient):
             acp_args=list(acp_args or args or resolve_kiro_args()),
             **kwargs,
         )
+        self._seat_warning_logged = False
+
+    def _active_seat(self):
+        root = Path(os.environ.get("KIRO_CONSOLE_HOME") or Path.home() / ".kiro-console")
+        try:
+            data = json.loads((root / "active-seat.json").read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("expected an object")
+            home = data.get("home")
+            if not isinstance(home, str) or not home or not Path(home).is_dir():
+                return root, "default", None
+            seat = data.get("seat")
+            return root, seat if isinstance(seat, str) and seat else "default", home
+        except FileNotFoundError:
+            return root, "default", None
+        except (OSError, ValueError, UnicodeError) as exc:
+            if not self._seat_warning_logged:
+                logger.warning("Could not read kiro-console active seat; using default: %s", exc)
+                self._seat_warning_logged = True
+            return root, "default", None
 
     def _create_chat_completion(self, *, model=None, messages=None, **kwargs):
         # The provider name is not a model id; treat it as "use the session
@@ -262,24 +285,82 @@ class KiroACPClient(CopilotACPClient):
         return super()._create_chat_completion(model=model, messages=messages, **kwargs)
 
     def _run_prompt(self, prompt_text: str, *, timeout_seconds: float, model: str | None = None) -> tuple[str, str]:
-        prompt_text = kiro_tool_prompt(prompt_text)
-        text, reasoning = super()._run_prompt(prompt_text, timeout_seconds=timeout_seconds, model=model)
-        repaired, broken = repair_tool_calls(text)
-        if not broken:
-            return repaired, reasoning
-        # One fresh attempt: a dropped block would end the turn on the narration before it.
-        logger.warning("Kiro ACP returned %d unparseable <tool_call> block(s); retrying once.", broken)
-        retry_text, retry_reasoning = super()._run_prompt(
-            f"{prompt_text}\n\n{_RETRY_NOTE}", timeout_seconds=timeout_seconds, model=model)
-        retry_repaired, retry_broken = repair_tool_calls(retry_text)
-        if retry_broken:
-            logger.warning("Kiro ACP retry still returned %d unparseable <tool_call> block(s).", retry_broken)
-        return retry_repaired, retry_reasoning
+        token = _turn_context.set({"model": model or "", "seat": "default", "root": None})
+        try:
+            prompt_text = kiro_tool_prompt(prompt_text)
+            text, reasoning = super()._run_prompt(prompt_text, timeout_seconds=timeout_seconds, model=model)
+            repaired, broken = repair_tool_calls(text)
+            if not broken:
+                return repaired, reasoning
+            logger.warning("Kiro ACP returned %d unparseable <tool_call> block(s); retrying once.", broken)
+            retry_text, retry_reasoning = super()._run_prompt(
+                f"{prompt_text}\n\n{_RETRY_NOTE}", timeout_seconds=timeout_seconds, model=model)
+            retry_repaired, retry_broken = repair_tool_calls(retry_text)
+            if retry_broken:
+                logger.warning("Kiro ACP retry still returned %d unparseable <tool_call> block(s).", retry_broken)
+            return retry_repaired, retry_reasoning
+        finally:
+            _turn_context.reset(token)
+
+    def _handle_server_message(self, msg, **kwargs):
+        if msg.get("method") == "_kiro.dev/metadata":
+            try:
+                params = msg.get("params")
+                if isinstance(params, dict) and isinstance(params.get("meteringUsage"), list):
+                    credits = next((item["value"] for item in params["meteringUsage"]
+                                    if isinstance(item, dict) and item.get("unit") == "credit"
+                                    and isinstance(item.get("value"), (int, float))
+                                    and not isinstance(item["value"], bool)), None)
+                    duration = params.get("turnDurationMs")
+                    context = _turn_context.get() or {}
+                    root = context.get("root")
+                    if credits is not None and isinstance(duration, (int, float)) and root and root.is_dir():
+                        record = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                                  "seat": context.get("seat", "default"), "model": context.get("model", ""),
+                                  "credits": credits, "turn_ms": duration}
+                        fd = os.open(root / "metering.jsonl", os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+                        with os.fdopen(fd, "a", encoding="utf-8") as out:
+                            out.write(json.dumps(record, separators=(",", ":")) + "\n")
+            except Exception:
+                logger.debug("Could not append kiro-console metering", exc_info=True)
+            return True
+        return super()._handle_server_message(msg, **kwargs)
 
     def _spawn(self):  # noqa: ANN202 - matches parent's Popen[str] return
-        ensure_kiro_agent(self._acp_args)
+        root, seat, home = self._active_seat()
+        context = _turn_context.get()
+        if context is not None:
+            _turn_context.set({**context, "root": root, "seat": seat})
+        ensure_kiro_agent(self._acp_args, home)
         try:
-            return super()._spawn()
+            if not home:
+                return super()._spawn()
+            # Mirror ACPClient._spawn only for an isolated seat: the parent builds its
+            # environment internally, after Hermes may have overridden HOME.
+            if _acp._acp_supported(self._acp_command, self._acp_args) is False:
+                preview = " ".join(self._acp_args[:3]) if self._acp_args else "(none)"
+                raise RuntimeError(
+                    f"ACP transport not supported by '{self._acp_command}': `{preview}` is rejected as an unknown option. "
+                    "This usually means the CLI is an older release (e.g. Claude Code v2.x) or a different tool than expected. "
+                    + self.unsupported_transport_hint)
+            from hermes_cli._subprocess_compat import windows_hide_flags
+            env = _acp._build_subprocess_env()
+            env["HOME"] = home
+            try:
+                proc = subprocess.Popen(
+                    [self._acp_command] + self._acp_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1,
+                    cwd=self._acp_cwd, env=env, creationflags=windows_hide_flags())
+            except FileNotFoundError as exc:
+                raise RuntimeError(
+                    f"Could not start {self.label} command '{self._acp_command}'. {self._missing_command_hint()}") from exc
+            if proc.stdin is None or proc.stdout is None:
+                proc.kill()
+                raise RuntimeError(f"{self.label} process did not expose stdin/stdout pipes.")
+            with self._active_process_lock:
+                self._active_processes.add(proc)
+                self.is_closed = False
+            return proc
         except RuntimeError as exc:
             # Translate the Copilot-flavored install hint into a Kiro one.
             if "Could not start Copilot ACP command" in str(exc):

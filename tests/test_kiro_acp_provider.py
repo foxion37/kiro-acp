@@ -218,3 +218,92 @@ class TestRealDiscovery:
 
 def get_provider_profile_by_alias(providers, alias: str):
     return providers.get_provider_profile(alias)
+
+
+class TestKiroConsole:
+    def test_selected_home_wins_over_hermes_environment(self, tmp_path, monkeypatch):
+        mod = _client_module(monkeypatch)
+        monkeypatch.setenv("KIRO_CONSOLE_HOME", str(tmp_path))
+        home = tmp_path / "seat-home"
+        home.mkdir()
+        (tmp_path / "active-seat.json").write_text(json.dumps({"seat": "seat-a", "home": str(home)}))
+        monkeypatch.setattr(mod._acp, "_acp_supported", lambda *args: True)
+        monkeypatch.setattr(mod._acp, "_build_subprocess_env", lambda: {"HOME": "/hermes-override"})
+        captured = {}
+        # The active process collection requires hashable objects.
+        class Process:
+            stdin = object()
+            stdout = object()
+        proc = Process()
+        def popen(*args, **kwargs):
+            captured.update(kwargs)
+            return proc
+        monkeypatch.setattr(mod.subprocess, "Popen", popen)
+        client = mod.KiroACPClient()
+        assert client._spawn() is proc
+        assert captured["env"]["HOME"] == str(home)
+        assert (home / ".kiro" / "agents" / "hermes-bridge.json").is_file()
+
+    def test_fallbacks_use_original_spawn(self, tmp_path, monkeypatch):
+        mod = _client_module(monkeypatch)
+        monkeypatch.setenv("KIRO_CONSOLE_HOME", str(tmp_path))
+        monkeypatch.setattr(mod, "ensure_kiro_agent", lambda *args: None)
+        marker = object()
+        monkeypatch.setattr(mod.CopilotACPClient, "_spawn", lambda self: marker)
+        client = mod.KiroACPClient()
+        path = tmp_path / "active-seat.json"
+        assert client._spawn() is marker
+        for content in ('{"seat":"default","home":null}',
+                        json.dumps({"seat": "bad", "home": str(tmp_path / "missing")}),
+                        "{invalid"):
+            path.write_text(content)
+            assert client._spawn() is marker
+
+    def test_metering_attaches_spawn_seat_and_model(self, tmp_path, monkeypatch):
+        mod = _client_module(monkeypatch)
+        monkeypatch.setenv("KIRO_CONSOLE_HOME", str(tmp_path))
+        monkeypatch.setattr(mod, "ensure_kiro_agent", lambda *args: None)
+        monkeypatch.setattr(mod.CopilotACPClient, "_spawn", lambda self: object())
+        message = {"jsonrpc": "2.0", "method": "_kiro.dev/metadata",
+                   "params": {"sessionId": "s", "contextUsagePercentage": 3.2,
+                              "meteringUsage": [{"value": 0.3266, "unit": "credit",
+                                                 "unitPlural": "credits"}],
+                              "turnDurationMs": 6383}}
+        home = tmp_path / "seat-home"
+        home.mkdir()
+        (tmp_path / "active-seat.json").write_text(json.dumps({"seat": "seat-a", "home": str(home)}))
+        def run_prompt(client, prompt_text, *, timeout_seconds, model):
+            # A mocked spawn still records the seat, without starting Kiro.
+            monkeypatch.setattr(mod._acp, "_acp_supported", lambda *args: True)
+            class Process:
+                stdin = object()
+                stdout = object()
+            monkeypatch.setattr(mod.subprocess, "Popen", lambda *args, **kwargs: Process())
+            client._spawn()
+            (tmp_path / "active-seat.json").write_text('{"seat":"default","home":null}')
+            assert client._handle_server_message(message)
+            return "ok", ""
+        monkeypatch.setattr(mod.CopilotACPClient, "_run_prompt", run_prompt)
+        client = mod.KiroACPClient()
+        assert client._run_prompt("hello", timeout_seconds=1, model="claude-sonnet-5.5") == ("ok", "")
+        path = tmp_path / "metering.jsonl"
+        record = json.loads(path.read_text())
+        assert record["ts"].endswith("Z")
+        assert {k: record[k] for k in ("seat", "model", "credits", "turn_ms")} == {
+            "seat": "seat-a", "model": "claude-sonnet-5.5", "credits": 0.3266, "turn_ms": 6383}
+        assert path.stat().st_mode & 0o777 == 0o600
+
+    def test_metering_does_not_create_data_root(self, tmp_path, monkeypatch):
+        mod = _client_module(monkeypatch)
+        root = tmp_path / "missing"
+        monkeypatch.setenv("KIRO_CONSOLE_HOME", str(root))
+        monkeypatch.setattr(mod, "ensure_kiro_agent", lambda *args: None)
+        monkeypatch.setattr(mod.CopilotACPClient, "_spawn", lambda self: object())
+        def run_prompt(client, prompt_text, *, timeout_seconds, model):
+            client._spawn()
+            client._handle_server_message({"method": "_kiro.dev/metadata", "params": {
+                "meteringUsage": [{"value": 1, "unit": "credit"}], "turnDurationMs": 42}})
+            return "ok", ""
+        monkeypatch.setattr(mod.CopilotACPClient, "_run_prompt", run_prompt)
+        mod.KiroACPClient()._run_prompt("hello", timeout_seconds=1, model="test")
+        assert not root.exists()
