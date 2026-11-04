@@ -52,7 +52,8 @@ cannot erase it.
 ## kiro-console integration
 
 Each spawn reads `$KIRO_CONSOLE_HOME/active-seat.json` (default
-`~/.kiro-console`) and uses its existing seat HOME for Kiro and its bridge
+`~/.kiro-console`); `consumers.hermes` (v2, per-consumer target) wins over the
+top-level seat. It uses that seat's existing HOME for Kiro and its bridge
 agent config. Missing, unreadable, malformed, null-HOME or nonexistent-directory
 selections use the original spawn. End-of-turn credit metadata is appended to
 `metering.jsonl` in that root (new files mode 600); the root is never created by

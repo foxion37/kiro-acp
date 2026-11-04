@@ -83,7 +83,8 @@ missing or differs; Hermes' tools stay the only way the model can act.
 ## kiro-console integration
 
 When kiro-console is installed, each spawn reads `active-seat.json` under
-`$KIRO_CONSOLE_HOME` (default `~/.kiro-console`). An existing seat HOME is used
+`$KIRO_CONSOLE_HOME` (default `~/.kiro-console`), preferring the `consumers.hermes`
+target over the global seat. An existing seat HOME is used
 for Kiro and its bridge agent configuration; a missing, unreadable, malformed,
 null-HOME or nonexistent-directory selection falls back to the normal spawn.
 Completed-turn credit metadata is appended to `metering.jsonl` in that data

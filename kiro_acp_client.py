@@ -263,6 +263,10 @@ class KiroACPClient(CopilotACPClient):
             data = json.loads((root / "active-seat.json").read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 raise ValueError("expected an object")
+            # v2: kiro-console resolves a per-consumer target; v1 files only have the top level.
+            consumer = (data.get("consumers") or {}).get("hermes") if isinstance(data.get("consumers"), dict) else None
+            if isinstance(consumer, dict):
+                data = consumer
             home = data.get("home")
             if not isinstance(home, str) or not home or not Path(home).is_dir():
                 return root, "default", None

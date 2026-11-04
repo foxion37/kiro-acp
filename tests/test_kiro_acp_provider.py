@@ -244,6 +244,25 @@ class TestKiroConsole:
         assert captured["env"]["HOME"] == str(home)
         assert (home / ".kiro" / "agents" / "hermes-bridge.json").is_file()
 
+    def test_hermes_consumer_target_overrides_global_seat(self, tmp_path, monkeypatch):
+        mod = _client_module(monkeypatch)
+        monkeypatch.setenv("KIRO_CONSOLE_HOME", str(tmp_path))
+        monkeypatch.setattr(mod, "ensure_kiro_agent", lambda *args: None)
+        global_home, pinned_home = tmp_path / "seat-a", tmp_path / "seat-b"
+        global_home.mkdir()
+        pinned_home.mkdir()
+        path = tmp_path / "active-seat.json"
+        doc = {"seat": "seat-a", "home": str(global_home), "consumers": {
+            "hermes": {"mode": "pinned", "seat": "seat-b", "home": str(pinned_home)},
+            "omp": {"mode": "follow", "seat": "seat-a", "home": None}}}
+        path.write_text(json.dumps(doc))
+        client = mod.KiroACPClient()
+        assert client._active_seat()[1:] == ("seat-b", str(pinned_home))
+        # Hermes pinned to the default login runs as today even while the global seat is isolated.
+        doc["consumers"]["hermes"] = {"mode": "pinned", "seat": "default", "home": None}
+        path.write_text(json.dumps(doc))
+        assert client._active_seat()[1:] == ("default", None)
+
     def test_fallbacks_use_original_spawn(self, tmp_path, monkeypatch):
         mod = _client_module(monkeypatch)
         monkeypatch.setenv("KIRO_CONSOLE_HOME", str(tmp_path))
