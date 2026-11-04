@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+import json
 from pathlib import Path
 
 import pytest
@@ -76,6 +77,60 @@ class TestProfileContract:
         assert client._acp_command == "kiro-cli"
         assert client._acp_args == ["acp"]
         assert client.base_url == "acp://kiro"
+
+
+# Kiro's real failure: the arguments string lost its closing quote, so the block is not JSON.
+_BROKEN_CALL = (
+    r"""<tool_call>{"id":"call_1","type":"function","function":{"name":"terminal","arguments":"""
+    r""""{\"command\":\"grep -n 'a\\|\\\"b\\\"' f.py | head -5\"}}</tool_call>"""
+)
+_GOOD_CALL = '<tool_call>{"id":"call_2","type":"function","function":{"name":"terminal","arguments":"{\\"command\\": \\"ls\\"}"}}</tool_call>'
+
+
+def _client_module(monkeypatch):
+    mod = _load_plugin(monkeypatch)
+    return importlib.import_module(f"{mod.__name__}.kiro_acp_client")
+
+
+class TestToolCallRepair:
+    def test_broken_arguments_string_becomes_a_runnable_call(self, monkeypatch):
+        from agent.acp_openai_bridge import extract_tool_calls_from_text
+
+        client_mod = _client_module(monkeypatch)
+        text = "확인합니다.\n\n" + _BROKEN_CALL
+        assert extract_tool_calls_from_text(text)[0] == []  # the bridge alone drops it
+
+        repaired, broken = client_mod.repair_tool_calls(text)
+        calls, cleaned = extract_tool_calls_from_text(repaired)
+
+        assert broken == 0
+        assert cleaned == "확인합니다."
+        assert [(c.id, c.function.name) for c in calls] == [("call_1", "terminal")]
+        assert json.loads(calls[0].function.arguments) == {"command": "grep -n 'a\\|\"b\"' f.py | head -5"}
+
+    def test_valid_blocks_and_prose_mentions_pass_through(self, monkeypatch):
+        client_mod = _client_module(monkeypatch)
+        text = "Use a <tool_call> tag.\n" + _GOOD_CALL
+        assert client_mod.repair_tool_calls(text) == (text, 0)
+
+    def test_unclosed_valid_block_gets_closed(self, monkeypatch):
+        client_mod = _client_module(monkeypatch)
+        assert client_mod.repair_tool_calls(_GOOD_CALL[: -len("</tool_call>")]) == (_GOOD_CALL, 0)
+
+    def test_unrecoverable_block_triggers_one_retry(self, monkeypatch):
+        client_mod = _client_module(monkeypatch)
+        prompts: list[str] = []
+        replies = iter(["보겠습니다.\n<tool_call>{\"function\": oops}</tool_call>", _GOOD_CALL])
+
+        def fake_run_prompt(self, prompt_text, *, timeout_seconds, model=None):
+            prompts.append(prompt_text)
+            return next(replies), ""
+
+        monkeypatch.setattr(client_mod.CopilotACPClient, "_run_prompt", fake_run_prompt)
+        client = client_mod.KiroACPClient(command="kiro-cli", args=["acp"])
+
+        assert client._run_prompt("P", timeout_seconds=5) == (_GOOD_CALL, "")
+        assert prompts == ["P", f"P\n\n{client_mod._RETRY_NOTE}"]
 
 
 class TestRealDiscovery:
