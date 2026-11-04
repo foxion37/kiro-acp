@@ -22,25 +22,58 @@ import re
 import shlex
 from typing import Any
 
+from agent import acp_client as _acp
+from agent.acp_openai_bridge import TOOL_CALL_CONTRACT
 from agent.copilot_acp_client import ACP_MARKER_BASE_URL as _COPILAT_MARKER, CopilotACPClient
 
 logger = logging.getLogger(__name__)
 
 KIRO_MARKER_BASE_URL = "acp://kiro"
 
-# Hermes' shared bridge drops a <tool_call> block whose JSON does not parse, leaving only
-# the narration before it ("...확인하겠습니다.") as a finished turn. Kiro models mostly break
-# the doubly-escaped ``arguments`` string, so repair that before the bridge parses it.
-_TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)(?:</tool_call>|\Z)", re.DOTALL)
+# Root cause of cut-off turns: Hermes' bridge contract asks for a three-level object
+# ``{"id","type","function":{"name","arguments":"<JSON string>"}}``. The command inside the
+# arguments string is escaped twice, and the block ends in a run of closers; Kiro models drop a
+# quote or a brace there (measured: 7 of 10 calls malformed even with inline object arguments).
+# The bridge drops an unparseable block, so the turn ends on the narration before it.
+# Fix: Kiro gets a flat format with no nesting and single escaping,
+#   <tool_call name="terminal">{"command": "ls"}</tool_call>
+# and this module converts it to the bridge's canonical block before Hermes parses it.
+# Lost trailing braces / quotes are still repaired, and one retry runs if a block stays broken.
+_KIRO_TOOL_CONTRACT = (
+    "Available tools (JSON schema list below). To call a tool, emit "
+    '<tool_call name="TOOL_NAME">ARGUMENTS</tool_call> where ARGUMENTS is one JSON object holding the '
+    "tool's parameters. Emit one block per call; several blocks are allowed. "
+    'Example: <tool_call name="terminal">{"command": "ls -la"}</tool_call>'
+)
+_KIRO_PREAMBLE_LINE = (
+    "IMPORTANT: If you take an action with a tool, you MUST output it as a "
+    '<tool_call name="TOOL_NAME">{...arguments...}</tool_call> block as described below.'
+)
+# A block ends at its closer, at the next block (a forgotten closer), or at the end of the reply.
+_TOOL_CALL_RE = re.compile(
+    r'<tool_call(?:\s+name\s*=\s*"([^"]*)")?\s*>(.*?)(?:</tool_call>|(?=<tool_call[\s>])|\Z)', re.DOTALL)
 _ESCAPE_RE = re.compile(r"\\(.)", re.DOTALL)
+# Claude sometimes trails its native tool-call markup (``</parameter></invoke>``) after the JSON.
+_CLOSING_TAG_RE = re.compile(r"</[\w:.-]+>")
 _FIELD_RE = {key: re.compile(rf'"{key}"\s*:\s*"([^"\\]+)"') for key in ("id", "name")}
 _ARGUMENTS_RE = re.compile(r'"arguments"\s*:\s*')
 _DECODER = json.JSONDecoder()
 _RETRY_NOTE = (
-    "Your previous reply contained a <tool_call> block that was not valid JSON, so it could not be run. "
-    "Reply again from the same point. Each <tool_call> must hold one valid JSON object; "
-    "function.arguments is a JSON string, so escape every quote and backslash inside it."
+    "Your previous reply contained a <tool_call> block whose arguments were not valid JSON, so it could "
+    'not be run. Reply again from the same point, using <tool_call name="TOOL_NAME">{...}</tool_call> '
+    "with one complete JSON object inside."
 )
+
+
+def kiro_tool_prompt(prompt_text: str) -> str:
+    """Swap Hermes' nested tool-call contract (and its preamble line) for the flat Kiro format."""
+    if TOOL_CALL_CONTRACT not in prompt_text:
+        return prompt_text  # no tools in this prompt, or upstream reworded the contract
+    prompt_text = prompt_text.replace(TOOL_CALL_CONTRACT, _KIRO_TOOL_CONTRACT, 1)
+    for line in _acp._PROMPT_PREAMBLE:
+        if "<tool_call>" in line:
+            prompt_text = prompt_text.replace(line, _KIRO_PREAMBLE_LINE, 1)
+    return prompt_text
 
 
 def _fix_escapes(text: str) -> str:
@@ -48,16 +81,25 @@ def _fix_escapes(text: str) -> str:
     return _ESCAPE_RE.sub(lambda m: m.group(0) if m.group(1) in '"\\/bfnrtu' else "\\\\" + m.group(1), text)
 
 
-def _leading_object(text: str) -> dict[str, Any] | None:
-    """JSON object at the start of ``text``, tolerating stray closers after it."""
-    for candidate in (text, _fix_escapes(text)):
-        try:
-            obj, end = _DECODER.raw_decode(candidate.lstrip())
-        except ValueError:
-            continue
-        if isinstance(obj, dict) and not candidate.lstrip()[end:].strip(' \t\r\n}"'):
-            return obj
+def _object_and_rest(text: str) -> tuple[dict[str, Any], str] | None:
+    """JSON object at the start of ``text`` plus the text after it, minus stray closers and leaked
+    closing tags; tolerates up to two lost ``}``."""
+    text = text.strip()
+    for fixed in (text, _fix_escapes(text)):
+        for candidate in (fixed, fixed + "}", fixed + "}}"):
+            try:
+                obj, end = _DECODER.raw_decode(candidate)
+            except ValueError:
+                continue
+            if isinstance(obj, dict):
+                return obj, _CLOSING_TAG_RE.sub("", candidate[end:]).strip(' \t\r\n}"')
     return None
+
+
+def _leading_object(text: str) -> dict[str, Any] | None:
+    """JSON object that makes up all of ``text`` (see ``_object_and_rest``)."""
+    found = _object_and_rest(text)
+    return found[0] if found is not None and not found[1] else None
 
 
 def _salvage_arguments(rest: str) -> dict[str, Any] | None:
@@ -79,8 +121,16 @@ def _salvage_arguments(rest: str) -> dict[str, Any] | None:
     return None
 
 
+def _block(name: str, args: dict[str, Any], call_id: str | None = None) -> str:
+    payload: dict[str, Any] = {
+        "type": "function", "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
+    if call_id:
+        payload = {"id": call_id, **payload}
+    return f"<tool_call>{json.dumps(payload, ensure_ascii=False)}</tool_call>"
+
+
 def _canonical_block(body: str) -> str | None:
-    """Repaired ``<tool_call>`` block for ``body``: None when it already parses, "" when unrecoverable.
+    """Repaired bridge-format block for ``body``: None when it already parses, "" when unrecoverable.
 
     Only the block's own JSON is repaired; a parseable block passes through even when its
     ``arguments`` string is bad JSON."""
@@ -100,25 +150,27 @@ def _canonical_block(body: str) -> str | None:
     if args is None:
         return ""
     call_id = _FIELD_RE["id"].search(body)
-    payload: dict[str, Any] = {
-        "type": "function", "function": {"name": name.group(1), "arguments": json.dumps(args, ensure_ascii=False)}}
-    if call_id is not None:
-        payload = {"id": call_id.group(1), **payload}
-    return f"<tool_call>{json.dumps(payload, ensure_ascii=False)}</tool_call>"
+    return _block(name.group(1), args, call_id.group(1) if call_id else None)
 
 
 def repair_tool_calls(text: str) -> tuple[str, int]:
-    """Rewrite malformed ``<tool_call>`` blocks as valid JSON → ``(text, unrecoverable_count)``.
+    """Convert Kiro's ``<tool_call name=...>`` blocks to the bridge format and repair malformed
+    bridge-format blocks → ``(text, unrecoverable_count)``.
 
-    Parseable closed blocks are left byte-for-byte; an unclosed trailing block gets its closer."""
+    Parseable closed bridge-format blocks are left byte-for-byte; an unclosed trailing one gets its closer."""
     broken = 0
 
     def _replace(match: re.Match[str]) -> str:
         nonlocal broken
-        original, body = match.group(0), match.group(1).strip()
+        original, name, body = match.group(0), (match.group(1) or "").strip(), match.group(2).strip()
         if not body.startswith("{"):  # a prose mention of the tag, not a call
             return original
-        block = _canonical_block(body)
+        if name:
+            # Prose the model wrote after a call it forgot to close stays as text after the block.
+            found = _object_and_rest(body)
+            block = "" if found is None else _block(name, found[0]) + (f"\n{found[1]}" if found[1] else "")
+        else:
+            block = _canonical_block(body)
         if block == "":
             broken += 1
             return original
@@ -175,6 +227,7 @@ class KiroACPClient(CopilotACPClient):
         return super()._create_chat_completion(model=model, messages=messages, **kwargs)
 
     def _run_prompt(self, prompt_text: str, *, timeout_seconds: float, model: str | None = None) -> tuple[str, str]:
+        prompt_text = kiro_tool_prompt(prompt_text)
         text, reasoning = super()._run_prompt(prompt_text, timeout_seconds=timeout_seconds, model=model)
         repaired, broken = repair_tool_calls(text)
         if not broken:

@@ -132,6 +132,42 @@ class TestToolCallRepair:
         assert client._run_prompt("P", timeout_seconds=5) == (_GOOD_CALL, "")
         assert prompts == ["P", f"P\n\n{client_mod._RETRY_NOTE}"]
 
+    def test_prompt_uses_flat_format_and_flat_calls_reach_the_bridge(self, monkeypatch):
+        from agent.acp_client import _format_messages_as_prompt
+        from agent.acp_openai_bridge import extract_tool_calls_from_text
+
+        client_mod = _client_module(monkeypatch)
+        tools = [{"type": "function", "function": {"name": "terminal", "parameters": {"type": "object"}}}]
+        prompt = client_mod.kiro_tool_prompt(
+            _format_messages_as_prompt([{"role": "user", "content": "hi"}], tools=tools))
+        assert "must be a JSON string" not in prompt
+        assert "OpenAI function-call shape" not in prompt
+        assert '<tool_call name="TOOL_NAME">' in prompt
+
+        # Flat calls with the measured Kiro failures: a lost closing brace, leaked native markup.
+        text = ('보겠습니다.\n<tool_call name="terminal">{"command": "grep \'a\\\\|b\' f"}</parameter>\n</invoke></tool_call>\n'
+                '<tool_call name="read_file">{"path": "x.py"</tool_call>')
+        repaired, broken = client_mod.repair_tool_calls(text)
+        calls, cleaned = extract_tool_calls_from_text(repaired)
+
+        assert broken == 0
+        assert cleaned == "보겠습니다."
+        assert [(c.function.name, json.loads(c.function.arguments)) for c in calls] == [
+            ("terminal", {"command": "grep 'a\\|b' f"}), ("read_file", {"path": "x.py"})]
+
+    def test_forgotten_closer_keeps_both_calls_and_the_prose(self, monkeypatch):
+        from agent.acp_openai_bridge import extract_tool_calls_from_text
+
+        client_mod = _client_module(monkeypatch)
+        text = ('<tool_call name="terminal">{"command": "du -sh x"}</parameter>\n</invoke>\n\n'
+                'Correction, again:\n\n<tool_call name="terminal">{"command": "git log -1"}')
+        repaired, broken = client_mod.repair_tool_calls(text)
+        calls, cleaned = extract_tool_calls_from_text(repaired)
+
+        assert broken == 0
+        assert cleaned == "Correction, again:"
+        assert [json.loads(c.function.arguments)["command"] for c in calls] == ["du -sh x", "git log -1"]
+
 
 class TestRealDiscovery:
     def test_plugin_dir_discovered_from_isolated_hermes_home(self, tmp_path, monkeypatch):
