@@ -52,7 +52,7 @@ class TestProfileContract:
         assert profile is not None
         assert profile.auth_type == "external_process"
         assert profile.process_command == "kiro-cli"
-        assert profile.process_args == ("acp",)
+        assert profile.process_args == ("acp", "--agent", "hermes-bridge")
         assert "kiro" in profile.aliases
 
     def test_env_overrides_replace_command_and_args(self, monkeypatch):
@@ -68,15 +68,36 @@ class TestProfileContract:
         monkeypatch.delenv("KIRO_CLI_PATH", raising=False)
         monkeypatch.delenv("HERMES_KIRO_ACP_ARGS", raising=False)
         assert mod.resolve_kiro_command() == "kiro-cli"
-        assert mod.resolve_kiro_args() == ["acp"]
+        assert mod.resolve_kiro_args() == ["acp", "--agent", "hermes-bridge"]
 
     def test_create_client_returns_kiro_client_with_profile_defaults(self, monkeypatch):
         mod = _load_plugin(monkeypatch)
         client = mod.kiro_acp.create_client()
         assert type(client).__name__ == "KiroACPClient"
         assert client._acp_command == "kiro-cli"
-        assert client._acp_args == ["acp"]
+        assert client._acp_args == ["acp", "--agent", "hermes-bridge"]
         assert client.base_url == "acp://kiro"
+
+    def test_spawn_writes_tool_less_agent_it_selects(self, monkeypatch, tmp_path):
+        # Kiro's own tools let the model act outside <tool_call>; Hermes cancels the permission
+        # request and the turn ends on narration. The selected agent must expose no tools.
+        mod = _client_module(monkeypatch)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        path = tmp_path / ".kiro" / "agents" / "hermes-bridge.json"
+        path.parent.mkdir(parents=True)
+        path.write_text('{"name": "hermes-bridge", "tools": ["*"]}')
+        client = mod.KiroACPClient(command="/nonexistent/kiro-cli")
+        with pytest.raises(RuntimeError, match="Could not start Kiro ACP command"):
+            client._spawn()
+        config = json.loads(path.read_text())
+        assert config["name"] == "hermes-bridge"
+        assert config["tools"] == [] and config["includeMcpJson"] is False
+
+    def test_other_agent_override_leaves_kiro_config_alone(self, monkeypatch, tmp_path):
+        mod = _client_module(monkeypatch)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        mod.ensure_kiro_agent(["acp", "--agent", "builder"])
+        assert not (tmp_path / ".kiro").exists()
 
 
 # Kiro's real failure: the arguments string lost its closing quote, so the block is not JSON.

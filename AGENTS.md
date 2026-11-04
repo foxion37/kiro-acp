@@ -23,6 +23,11 @@ Logs may show `Empty response … provider=kiro-acp` or
    closers. Kiro models drop a quote or `}` there (measured: 7 of 10 calls broken).
 3. `extract_tool_calls_from_text` silently drops a block that is not valid JSON,
    so only the narration before it survives and the turn ends.
+4. Second path to the same symptom: under `kiro_default` the model also sees
+   Kiro's own tools (read, shell, ...) and sometimes calls them natively instead
+   of writing `<tool_call>`. Hermes answers `session/request_permission` with
+   `cancelled`, Kiro stops with `stopReason: "refusal"`, and only the narration
+   reaches Hermes (measured: 1 of 4 replays; 0 of 8 with the tool-less agent).
 
 ## What the fix does (`kiro_acp_client.py`)
 
@@ -36,6 +41,10 @@ Logs may show `Empty response … provider=kiro-acp` or
   form with a lost closing quote.
 - `KiroACPClient._run_prompt`: applies both and re-prompts once (`_RETRY_NOTE`)
   only when a block stays unrecoverable.
+- `DEFAULT_KIRO_ARGS` / `ensure_kiro_agent`: spawn `kiro-cli acp --agent
+  hermes-bridge` and write `~/.kiro/agents/hermes-bridge.json` (`tools: []`, no
+  MCP) before each spawn when missing or changed. An `HERMES_KIRO_ACP_ARGS`
+  override that picks another agent brings native tools back.
 
 All of this lives in the plugin, never in hermes-agent core, so `hermes update`
 cannot erase it.
@@ -46,6 +55,8 @@ cannot erase it.
    (`~/.hermes/plugins/kiro-acp-provider` and
    `~/.hermes/profiles/*/plugins/kiro-acp-provider`): `git log --oneline -3`
    must contain this repo's commits and `git remote -v` must point at this repo.
+   During a turn, `ps` must show `kiro-cli acp --agent hermes-bridge`; plain
+   `kiro-cli acp` means an `HERMES_KIRO_ACP_ARGS` override or a stale process.
 2. **Did core change underneath?** Compare `TOOL_CALL_CONTRACT` and the
    `<tool_call>` line of `_PROMPT_PREAMBLE` in
    `~/.hermes/hermes-agent/agent/acp_openai_bridge.py` / `agent/acp_client.py`

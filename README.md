@@ -3,8 +3,10 @@
 Fork of [tobenwarrior/hermes-kiro-provider](https://github.com/tobenwarrior/hermes-kiro-provider)
 that fixes Kiro turns ending mid-sentence ("…확인하겠습니다." with no tool call):
 Kiro gets a flat `<tool_call name="TOOL">{arguments}</tool_call>` format instead
-of Hermes' nested string-arguments contract, and malformed blocks are repaired
-before Hermes parses them. Agents: start with [AGENTS.md](AGENTS.md).
+of Hermes' nested string-arguments contract, malformed blocks are repaired
+before Hermes parses them, and Kiro runs as a tool-less `hermes-bridge` agent so
+the model cannot call Kiro's own tools (which Hermes cancels, ending the turn).
+Agents: start with [AGENTS.md](AGENTS.md).
 
 Use the [Kiro CLI](https://kiro.dev/) (AWS's agentic coding CLI) as a model
 provider inside [Hermes Agent](https://github.com/NousResearch/hermes-agent) —
@@ -62,7 +64,7 @@ login) — no API keys to configure.
 |---|---|---|
 | `HERMES_KIRO_ACP_COMMAND` | Path to a custom kiro binary | `kiro-cli` |
 | `KIRO_CLI_PATH` | Older alias for the same | — |
-| `HERMES_KIRO_ACP_ARGS` | Extra argv (shlex-split), e.g. `"acp --agent builder --effort high"` | `acp` |
+| `HERMES_KIRO_ACP_ARGS` | Extra argv (shlex-split), e.g. `"acp --agent hermes-bridge --effort high"`. Choosing another agent brings back Kiro's own tools and the cut-off turns they cause | `acp --agent hermes-bridge` |
 
 ## How it works
 
@@ -73,6 +75,10 @@ interface by extending the in-tree `copilot-acp` ACP shim (`agent.copilot_acp_cl
 file-safety bridge are inherited, so upstream fixes flow through. Model
 listing is delegated to the subprocess; `model="kiro-acp"` means "use the
 session default model".
+
+The default argv selects the `hermes-bridge` agent. Before each spawn the plugin
+writes `~/.kiro/agents/hermes-bridge.json` (no tools, no MCP servers) when it is
+missing or differs; Hermes' tools stay the only way the model can act.
 
 ## Development
 

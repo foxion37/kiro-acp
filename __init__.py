@@ -81,8 +81,9 @@ kiro_acp = KiroACPProfile(
     auth_type="external_process",
     # How to launch the CLI. Env overrides let users point at a custom binary
     # or pass extra flags (e.g. --agent / --effort) without editing the plugin.
+    # The default agent is kiro_acp_client.KIRO_AGENT_NAME (tool-less, written on spawn).
     process_command="kiro-cli",
-    process_args=("acp",),
+    process_args=("acp", "--agent", "hermes-bridge"),
     process_command_env_vars=("HERMES_KIRO_ACP_COMMAND", "KIRO_CLI_PATH"),
     process_args_env_var="HERMES_KIRO_ACP_ARGS",
 )

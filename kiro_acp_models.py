@@ -14,7 +14,7 @@ import subprocess
 import time
 from typing import Any
 
-from .kiro_acp_client import resolve_kiro_args, resolve_kiro_command
+from .kiro_acp_client import ensure_kiro_agent, resolve_kiro_args, resolve_kiro_command
 
 _INITIALIZE_PARAMS = {
     "protocolVersion": 1,
@@ -31,6 +31,7 @@ def list_kiro_models(timeout_seconds: float = 30.0) -> list[str] | None:
     """
     command = resolve_kiro_command()
     args = resolve_kiro_args()
+    ensure_kiro_agent(args)
     try:
         proc = subprocess.Popen(
             [command, *args],

@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import shlex
+from pathlib import Path
 from typing import Any
 
 from agent import acp_client as _acp
@@ -29,6 +30,21 @@ from agent.copilot_acp_client import ACP_MARKER_BASE_URL as _COPILAT_MARKER, Cop
 logger = logging.getLogger(__name__)
 
 KIRO_MARKER_BASE_URL = "acp://kiro"
+
+# Second cause of cut-off turns: ``kiro_default`` gives the model Kiro's own tools (read, shell, ...).
+# The model sometimes calls those natively instead of writing a <tool_call> block; Hermes answers
+# Kiro's permission request with "cancelled", Kiro ends the turn with stopReason "refusal", and only
+# the narration before the call reaches Hermes (measured: 1 of 4 replays). A dedicated agent with no
+# tools and no MCP servers leaves the <tool_call> text as the model's only way to act.
+KIRO_AGENT_NAME = "hermes-bridge"
+DEFAULT_KIRO_ARGS = ("acp", "--agent", KIRO_AGENT_NAME)
+_KIRO_AGENT_CONFIG = {
+    "name": KIRO_AGENT_NAME,
+    "description": "Text-only agent for Hermes: no Kiro tools; Hermes runs tools from <tool_call> blocks.",
+    "tools": [],
+    "includeMcpJson": False,
+    "resources": [],
+}
 
 # Root cause of cut-off turns: Hermes' bridge contract asks for a three-level object
 # ``{"id","type","function":{"name","arguments":"<JSON string>"}}``. The command inside the
@@ -191,9 +207,28 @@ def resolve_kiro_command() -> str:
 
 
 def resolve_kiro_args() -> list[str]:
-    """Argv override (shlex-split), else ``['acp']``. Extra flags like
+    """Argv override (shlex-split), else ``DEFAULT_KIRO_ARGS`` (the tool-less agent). Extra flags like
     ``--agent NAME`` / ``--effort high`` / ``-a`` can be passed wholesale."""
-    return shlex.split(os.getenv("HERMES_KIRO_ACP_ARGS", "").strip()) or ["acp"]
+    return shlex.split(os.getenv("HERMES_KIRO_ACP_ARGS", "").strip()) or list(DEFAULT_KIRO_ARGS)
+
+
+def ensure_kiro_agent(args: list[str]) -> None:
+    """Write the tool-less agent config into Kiro's global agent dir when ``args`` select it and the
+    file is missing or differs. Other agents are the user's own and stay untouched."""
+    if not any(a == "--agent" and b == KIRO_AGENT_NAME for a, b in zip(args, args[1:])) \
+            and f"--agent={KIRO_AGENT_NAME}" not in args:
+        return
+    path = Path.home() / ".kiro" / "agents" / f"{KIRO_AGENT_NAME}.json"
+    text = json.dumps(_KIRO_AGENT_CONFIG, indent=2) + "\n"
+    try:
+        if path.is_file() and path.read_text(encoding="utf-8") == text:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:  # kiro-cli then reports the unknown agent itself
+        logger.warning("Could not write Kiro agent config %s: %s", path, exc)
 
 
 class KiroACPClient(CopilotACPClient):
@@ -242,6 +277,7 @@ class KiroACPClient(CopilotACPClient):
         return retry_repaired, retry_reasoning
 
     def _spawn(self):  # noqa: ANN202 - matches parent's Popen[str] return
+        ensure_kiro_agent(self._acp_args)
         try:
             return super()._spawn()
         except RuntimeError as exc:
