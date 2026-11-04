@@ -7,7 +7,7 @@ pytest; hermes third-party deps come from the checkout's venv via sys.path tail.
 import os
 import sys
 
-HERMES_REPO = os.environ.get("HERMES_REPO", "/Users/lucas/.hermes/hermes-agent")
+HERMES_REPO = os.environ.get("HERMES_REPO", os.path.expanduser("~/.hermes/hermes-agent"))
 if HERMES_REPO not in sys.path:
     sys.path.insert(0, HERMES_REPO)
 

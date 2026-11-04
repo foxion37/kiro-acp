@@ -1,4 +1,10 @@
-# hermes-kiro-provider
+# kiro-acp
+
+Fork of [tobenwarrior/hermes-kiro-provider](https://github.com/tobenwarrior/hermes-kiro-provider)
+that fixes Kiro turns ending mid-sentence ("…확인하겠습니다." with no tool call):
+Kiro gets a flat `<tool_call name="TOOL">{arguments}</tool_call>` format instead
+of Hermes' nested string-arguments contract, and malformed blocks are repaired
+before Hermes parses them. Agents: start with [AGENTS.md](AGENTS.md).
 
 Use the [Kiro CLI](https://kiro.dev/) (AWS's agentic coding CLI) as a model
 provider inside [Hermes Agent](https://github.com/NousResearch/hermes-agent) —
@@ -25,15 +31,15 @@ Verified against Kiro CLI 2.22.0 (`kiro-cli acp`, ACP protocol v1 over stdio).
 **Via the plugin installer** (recommended):
 
 ```bash
-hermes plugins install tobenwarrior/hermes-kiro-provider
+hermes plugins install foxion37/kiro-acp
 ```
 
 **Or manual drop-in**:
 
 ```bash
-git clone https://github.com/tobenwarrior/hermes-kiro-provider.git
+git clone https://github.com/foxion37/kiro-acp.git
 mkdir -p "${HERMES_HOME:-$HOME/.hermes}/plugins/model-providers"
-cp -r hermes-kiro-provider "${HERMES_HOME:-$HOME/.hermes}/plugins/model-providers/kiro-acp"
+cp -r kiro-acp "${HERMES_HOME:-$HOME/.hermes}/plugins/model-providers/kiro-acp"
 ```
 
 Both paths register the `kiro-acp` provider for the next session.
@@ -76,8 +82,9 @@ HERMES_REPO=/path/to/hermes-agent python -m pytest tests/ -q
 ```
 
 Tests cover the profile contract (registration, env overrides, client
-construction) and real discovery from an isolated `$HERMES_HOME` — no live
-Kiro calls.
+construction), real discovery from an isolated `$HERMES_HOME`, and the
+tool-call format and repair — no live Kiro calls. `scripts/replay_session.py`
+replays a real Hermes session against live Kiro to measure tool-call health.
 
 ## License
 
