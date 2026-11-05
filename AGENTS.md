@@ -59,6 +59,11 @@ selections use the original spawn. End-of-turn credit metadata is appended to
 `metering.jsonl` in that root (new files mode 600); the root is never created by
 the plugin, and append failures do not fail the turn. Seat and model are bound
 to the running turn, so changing seats does not relabel an in-flight process.
+For a resolved seat's ordered `chain`, quota/credit/throttle/auth errors retry
+the original prompt once per entry through the same spawn path, with that
+entry's HOME; unrelated errors propagate. The fallback selection stays bound
+through a tool-call repair retry, and metering records the seat of each spawn.
+An empty or absent chain does not change the original error behavior.
 
 ## When the symptom comes back
 

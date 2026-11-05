@@ -90,6 +90,11 @@ null-HOME or nonexistent-directory selection falls back to the normal spawn.
 Completed-turn credit metadata is appended to `metering.jsonl` in that data
 root (created mode 600); the plugin never creates the data root, and metering
 errors do not interrupt a turn.
+On quota, credit, throttle, or authentication failures, the same prompt is retried
+once per usable entry in the Hermes target's ordered `chain`, with that entry's
+HOME. Other errors propagate without failover. Each attempt uses the normal
+spawn and tool-call repair path; credit metadata is labeled with the seat that
+actually ran it. An absent or empty chain leaves the original behavior unchanged.
 
 ## Development
 

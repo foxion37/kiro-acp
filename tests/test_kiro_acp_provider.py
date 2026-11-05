@@ -326,3 +326,116 @@ class TestKiroConsole:
         monkeypatch.setattr(mod.CopilotACPClient, "_run_prompt", run_prompt)
         mod.KiroACPClient()._run_prompt("hello", timeout_seconds=1, model="test")
         assert not root.exists()
+
+    def test_quota_retries_chain_home_and_meters_answering_seat(self, tmp_path, monkeypatch):
+        mod = _client_module(monkeypatch)
+        monkeypatch.setenv("KIRO_CONSOLE_HOME", str(tmp_path))
+        homes = [tmp_path / name for name in ("primary", "fallback")]
+        for home in homes:
+            home.mkdir()
+        (tmp_path / "active-seat.json").write_text(json.dumps({"consumers": {"hermes": {
+            "seat": "primary", "home": str(homes[0]),
+            "chain": [{"seat": "fallback", "home": str(homes[1])}]}}}))
+        monkeypatch.setattr(mod, "ensure_kiro_agent", lambda *args: None)
+        monkeypatch.setattr(mod._acp, "_acp_supported", lambda *args: True)
+        monkeypatch.setattr(mod._acp, "_build_subprocess_env", lambda: {})
+        spawned = []
+        class Process:
+            stdin = object()
+            stdout = object()
+        def popen(*args, **kwargs):
+            spawned.append(kwargs["env"]["HOME"])
+            return Process()
+        monkeypatch.setattr(mod.subprocess, "Popen", popen)
+        prompts = []
+        def run_prompt(client, prompt_text, *, timeout_seconds, model):
+            client._spawn()
+            prompts.append(prompt_text)
+            if len(prompts) == 1:
+                raise RuntimeError("CREDIT quota exceeded")
+            client._handle_server_message({"method": "_kiro.dev/metadata", "params": {
+                "meteringUsage": [{"value": 0.5, "unit": "credit"}], "turnDurationMs": 20}})
+            return "fallback answer", ""
+        monkeypatch.setattr(mod.CopilotACPClient, "_run_prompt", run_prompt)
+        assert mod.KiroACPClient()._run_prompt("hello", timeout_seconds=1, model="test") == ("fallback answer", "")
+        assert spawned == [str(home) for home in homes]
+        assert prompts == ["hello", "hello"]
+        record = json.loads((tmp_path / "metering.jsonl").read_text())
+        assert record["seat"] == "fallback"
+        assert record["model"] == "test"
+
+    def test_non_quota_error_does_not_retry(self, tmp_path, monkeypatch):
+        mod = _client_module(monkeypatch)
+        monkeypatch.setenv("KIRO_CONSOLE_HOME", str(tmp_path))
+        home = tmp_path / "seat"
+        home.mkdir()
+        (tmp_path / "active-seat.json").write_text(json.dumps({"seat": "primary", "home": str(home),
+            "chain": [{"seat": "fallback", "home": str(home)}]}))
+        monkeypatch.setattr(mod, "ensure_kiro_agent", lambda *args: None)
+        monkeypatch.setattr(mod._acp, "_acp_supported", lambda *args: True)
+        class Process:
+            stdin = object()
+            stdout = object()
+        monkeypatch.setattr(mod.subprocess, "Popen", lambda *args, **kwargs: Process())
+        attempts = []
+        error = RuntimeError("protocol failure")
+        def run_prompt(client, prompt_text, *, timeout_seconds, model):
+            client._spawn()
+            attempts.append(prompt_text)
+            raise error
+        monkeypatch.setattr(mod.CopilotACPClient, "_run_prompt", run_prompt)
+        with pytest.raises(RuntimeError) as caught:
+            mod.KiroACPClient()._run_prompt("hello", timeout_seconds=1)
+        assert caught.value is error
+        assert attempts == ["hello"]
+
+    def test_empty_chain_keeps_original_failure(self, tmp_path, monkeypatch):
+        mod = _client_module(monkeypatch)
+        monkeypatch.setenv("KIRO_CONSOLE_HOME", str(tmp_path))
+        (tmp_path / "active-seat.json").write_text(json.dumps({"seat": "default", "home": None, "chain": []}))
+        monkeypatch.setattr(mod, "ensure_kiro_agent", lambda *args: None)
+        monkeypatch.setattr(mod.CopilotACPClient, "_spawn", lambda self: object())
+        attempts = []
+        error = TimeoutError("429 throttle")
+        def run_prompt(client, prompt_text, *, timeout_seconds, model):
+            client._spawn()
+            attempts.append(prompt_text)
+            raise error
+        monkeypatch.setattr(mod.CopilotACPClient, "_run_prompt", run_prompt)
+        with pytest.raises(TimeoutError) as caught:
+            mod.KiroACPClient()._run_prompt("hello", timeout_seconds=1)
+        assert caught.value is error
+        assert attempts == ["hello"]
+
+    def test_ordered_chain_and_tool_repair_retry_stay_on_selected_seat(self, tmp_path, monkeypatch):
+        mod = _client_module(monkeypatch)
+        monkeypatch.setenv("KIRO_CONSOLE_HOME", str(tmp_path))
+        homes = [tmp_path / name for name in ("one", "two", "three")]
+        for home in homes:
+            home.mkdir()
+        (tmp_path / "active-seat.json").write_text(json.dumps({
+            "seat": "one", "home": str(homes[0]),
+            "chain": [{"seat": home.name, "home": str(home)} for home in homes[1:]]}))
+        monkeypatch.setattr(mod, "ensure_kiro_agent", lambda *args: None)
+        monkeypatch.setattr(mod._acp, "_acp_supported", lambda *args: True)
+        monkeypatch.setattr(mod._acp, "_build_subprocess_env", lambda: {})
+        spawned, prompts = [], []
+        class Process:
+            stdin = object()
+            stdout = object()
+        def popen(*args, **kwargs):
+            spawned.append(kwargs["env"]["HOME"])
+            return Process()
+        monkeypatch.setattr(mod.subprocess, "Popen", popen)
+        def run_prompt(client, prompt_text, *, timeout_seconds, model):
+            client._spawn()
+            prompts.append(prompt_text)
+            if len(prompts) <= 2:
+                raise OSError("not logged in")
+            if len(prompts) == 3:
+                return '<tool_call>{"function": oops}</tool_call>', ""
+            return _GOOD_CALL, ""
+        monkeypatch.setattr(mod.CopilotACPClient, "_run_prompt", run_prompt)
+        assert mod.KiroACPClient()._run_prompt("hello", timeout_seconds=1) == (_GOOD_CALL, "")
+        assert spawned == [str(homes[0]), str(homes[1]), str(homes[2]), str(homes[2])]
+        assert prompts == ["hello", "hello", "hello", f"hello\n\n{mod._RETRY_NOTE}"]

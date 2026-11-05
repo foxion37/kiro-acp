@@ -32,6 +32,8 @@ from agent.copilot_acp_client import ACP_MARKER_BASE_URL as _COPILAT_MARKER, Cop
 
 logger = logging.getLogger(__name__)
 _turn_context = contextvars.ContextVar("kiro_console_turn", default=None)
+_FALLBACK_ERROR = re.compile(r"limit|quota|credit|throttl|429|exhaust|not logged in|unauthori|expired", re.IGNORECASE)
+
 
 KIRO_MARKER_BASE_URL = "acp://kiro"
 
@@ -257,7 +259,7 @@ class KiroACPClient(CopilotACPClient):
         )
         self._seat_warning_logged = False
 
-    def _active_seat(self):
+    def _seat_selection(self):
         root = Path(os.environ.get("KIRO_CONSOLE_HOME") or Path.home() / ".kiro-console")
         try:
             data = json.loads((root / "active-seat.json").read_text(encoding="utf-8"))
@@ -267,18 +269,31 @@ class KiroACPClient(CopilotACPClient):
             consumer = (data.get("consumers") or {}).get("hermes") if isinstance(data.get("consumers"), dict) else None
             if isinstance(consumer, dict):
                 data = consumer
+            chain = []
+            if isinstance(data.get("chain"), list):
+                for entry in data["chain"]:
+                    if not isinstance(entry, dict):
+                        continue
+                    fallback_seat, fallback_home = entry.get("seat"), entry.get("home")
+                    if (isinstance(fallback_seat, str) and fallback_seat
+                            and (fallback_home is None or
+                                 isinstance(fallback_home, str) and fallback_home and Path(fallback_home).is_dir())):
+                        chain.append((fallback_seat, fallback_home))
             home = data.get("home")
             if not isinstance(home, str) or not home or not Path(home).is_dir():
-                return root, "default", None
+                return root, "default", None, chain
             seat = data.get("seat")
-            return root, seat if isinstance(seat, str) and seat else "default", home
+            return root, seat if isinstance(seat, str) and seat else "default", home, chain
         except FileNotFoundError:
-            return root, "default", None
+            return root, "default", None, []
         except (OSError, ValueError, UnicodeError) as exc:
             if not self._seat_warning_logged:
                 logger.warning("Could not read kiro-console active seat; using default: %s", exc)
                 self._seat_warning_logged = True
-            return root, "default", None
+            return root, "default", None, []
+
+    def _active_seat(self):
+        return self._seat_selection()[:3]
 
     def _create_chat_completion(self, *, model=None, messages=None, **kwargs):
         # The provider name is not a model id; treat it as "use the session
@@ -292,17 +307,32 @@ class KiroACPClient(CopilotACPClient):
         token = _turn_context.set({"model": model or "", "seat": "default", "root": None})
         try:
             prompt_text = kiro_tool_prompt(prompt_text)
-            text, reasoning = super()._run_prompt(prompt_text, timeout_seconds=timeout_seconds, model=model)
-            repaired, broken = repair_tool_calls(text)
-            if not broken:
-                return repaired, reasoning
-            logger.warning("Kiro ACP returned %d unparseable <tool_call> block(s); retrying once.", broken)
-            retry_text, retry_reasoning = super()._run_prompt(
-                f"{prompt_text}\n\n{_RETRY_NOTE}", timeout_seconds=timeout_seconds, model=model)
-            retry_repaired, retry_broken = repair_tool_calls(retry_text)
-            if retry_broken:
-                logger.warning("Kiro ACP retry still returned %d unparseable <tool_call> block(s).", retry_broken)
-            return retry_repaired, retry_reasoning
+            chain = None
+            while True:
+                try:
+                    text, reasoning = super()._run_prompt(prompt_text, timeout_seconds=timeout_seconds, model=model)
+                    repaired, broken = repair_tool_calls(text)
+                    if not broken:
+                        return repaired, reasoning
+                    logger.warning("Kiro ACP returned %d unparseable <tool_call> block(s); retrying once.", broken)
+                    retry_text, retry_reasoning = super()._run_prompt(
+                        f"{prompt_text}\n\n{_RETRY_NOTE}", timeout_seconds=timeout_seconds, model=model)
+                    retry_repaired, retry_broken = repair_tool_calls(retry_text)
+                    if retry_broken:
+                        logger.warning("Kiro ACP retry still returned %d unparseable <tool_call> block(s).", retry_broken)
+                    return retry_repaired, retry_reasoning
+                except (RuntimeError, TimeoutError, OSError) as exc:
+                    context = _turn_context.get()
+                    if chain is None:
+                        chain = iter(context.get("chain", []))
+                    if not _FALLBACK_ERROR.search(str(exc)):
+                        raise
+                    next_seat = next(chain, None)
+                    if next_seat is None:
+                        raise
+                    seat, home = next_seat
+                    logger.warning("Kiro ACP seat %s failed; retrying with seat %s.", context["seat"], seat)
+                    _turn_context.set({**context, "selection": (context["root"], seat, home)})
         finally:
             _turn_context.reset(token)
 
@@ -331,8 +361,13 @@ class KiroACPClient(CopilotACPClient):
         return super()._handle_server_message(msg, **kwargs)
 
     def _spawn(self):  # noqa: ANN202 - matches parent's Popen[str] return
-        root, seat, home = self._active_seat()
         context = _turn_context.get()
+        if context is not None and "selection" in context:
+            root, seat, home = context["selection"]
+        else:
+            root, seat, home, chain = self._seat_selection()
+            if context is not None:
+                context = {**context, "chain": chain}
         if context is not None:
             _turn_context.set({**context, "root": root, "seat": seat})
         ensure_kiro_agent(self._acp_args, home)
